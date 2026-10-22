@@ -40,6 +40,10 @@ const RISK_WEIGHTS = {
     image_gps: 30,                 // 有 GPS 位置信息（高危）
     image_exif_sensitive: 15,      // 有敏感 EXIF 信息
     image_thumbnail_diff: 40,      // 缩略图与主图不一致（高危）
+    image_pii_id_card: 35,         // 图片中有身份证号（高危）
+    image_pii_phone: 25,           // 图片中有手机号
+    image_pii_name: 15,            // 图片中有姓名
+    image_pii_address: 25,         // 图片中有地址
 
     // PDF 相关
     pdf_incremental: 20,           // 有增量保存版本
@@ -59,6 +63,7 @@ const HIGH_RISK_KEYS = [
     "pptx_notes",                // PPT 演讲者备注页
     "image_gps",                 // 照片有 GPS 位置
     "image_thumbnail_diff",      // 缩略图是原图
+    "image_pii_id_card",         // 照片中有身份证号
     "pdf_fake_redaction",        // 假黑框遮挡
 ];
 
@@ -157,6 +162,51 @@ function calculateRisk(analysisResult) {
             details.image_thumbnail_diff = RISK_WEIGHTS.image_thumbnail_diff;
             totalScore += RISK_WEIGHTS.image_thumbnail_diff;
             reasons.push(`缩略图与主图差异达 ${img.thumbnail.diffPercent.toFixed(1)}%，缩略图可能泄露原始内容`);
+        }
+
+        // 图片内容中的个人信息（PII）
+        if (img.pii && img.pii.hasPii && img.pii.items && img.pii.items.length > 0) {
+            const piiItems = img.pii.items;
+
+            // 统计各类型数量
+            const idCardCount = piiItems.filter(i => i.type === "id_card").length;
+            const phoneCount = piiItems.filter(i => i.type === "phone").length;
+            const nameCount = piiItems.filter(i => i.type === "name").length;
+            const addressCount = piiItems.filter(i => i.type === "address").length;
+
+            // 身份证号（高危）
+            if (idCardCount > 0) {
+                details.image_pii_id_card = RISK_WEIGHTS.image_pii_id_card;
+                totalScore += RISK_WEIGHTS.image_pii_id_card;
+                reasons.push(`图片中检测到 ${idCardCount} 个身份证号，属于高度敏感个人信息`);
+            }
+
+            // 手机号
+            if (phoneCount > 0) {
+                details.image_pii_phone = RISK_WEIGHTS.image_pii_phone;
+                totalScore += RISK_WEIGHTS.image_pii_phone;
+                reasons.push(`图片中检测到 ${phoneCount} 个手机号`);
+            }
+
+            // 地址
+            if (addressCount > 0) {
+                details.image_pii_address = RISK_WEIGHTS.image_pii_address;
+                totalScore += RISK_WEIGHTS.image_pii_address;
+                reasons.push(`图片中检测到 ${addressCount} 个地址信息`);
+            }
+
+            // 姓名
+            if (nameCount > 0) {
+                details.image_pii_name = RISK_WEIGHTS.image_pii_name;
+                totalScore += RISK_WEIGHTS.image_pii_name;
+                reasons.push(`图片中检测到 ${nameCount} 个姓名`);
+            }
+        } else if (img.pii && img.pii.error) {
+            // OCR 失败或不可用，提示用户（不影响风险评分）
+            reasons.push(`ℹ️ 图片内容识别未启用：${img.pii.error}`);
+        } else if (img.pii && img.pii.ocrAvailable && (!img.pii.hasPii || img.pii.items.length === 0)) {
+            // OCR 成功运行但未检测到 PII
+            reasons.push("ℹ️ 已扫描图片内容，未检测到身份证号、手机号、姓名、地址等个人信息");
         }
     }
 

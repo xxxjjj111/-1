@@ -427,7 +427,7 @@ function renderDocxDetail(docxResult) {
  * 渲染图片检测详情卡片
  */
 function renderImageDetail(imgResult) {
-    const { exif, gps, thumbnail } = imgResult;
+    const { exif, gps, thumbnail, pii } = imgResult;
 
     const card = Utils.createEl("div", { class: "detail-card" });
     card.appendChild(Utils.createEl("h3", { class: "detail-title" }, "🖼️ 图片检测详情"));
@@ -501,6 +501,185 @@ function renderImageDetail(imgResult) {
         ));
     }
     card.appendChild(thumbSection);
+
+    // 图片内容个人信息（PII）检测
+    const piiSection = Utils.createEl("div", { class: "detail-section" });
+    piiSection.appendChild(Utils.createEl("h4", {}, "🔍 图片内容个人信息识别"));
+
+    if (!pii || pii.error) {
+        // OCR 不可用或出错
+        piiSection.appendChild(Utils.createEl("div", { class: "safe-text" },
+            pii && pii.error ? `文字识别未启用：${pii.error}` : "未进行图片内容识别"
+        ));
+    } else if (!pii.hasPii || pii.items.length === 0) {
+        if (pii.ocrAvailable) {
+            piiSection.appendChild(Utils.createEl("div", { class: "safe-text" },
+                "已扫描图片内容，未检测到身份证号、手机号、姓名、地址等个人信息"
+            ));
+        } else {
+            piiSection.appendChild(Utils.createEl("div", { class: "warning-text" },
+                "图片中未识别出可读取的文字内容"
+            ));
+        }
+    } else {
+        // 检测到个人信息，显示按类别选择的界面
+        const piiBox = Utils.createEl("div", { class: "danger-box" });
+
+        piiBox.appendChild(Utils.createEl("div", { class: "danger-title" },
+            `⚠️ 检测到图片中的个人信息`
+        ));
+        piiBox.appendChild(Utils.createEl("div", {
+            style: "margin-bottom: 12px; font-size: 13px; color: #666; line-height: 1.5;",
+        }, "图片中识别到以下类型的个人信息。请勾选您需要清洗（打码覆盖）的类别："));
+
+        // ===== 按类别分组 =====
+        const typeGroups = {};
+        pii.items.forEach((item, index) => {
+            if (!typeGroups[item.type]) {
+                typeGroups[item.type] = {
+                    type: item.type,
+                    typeLabel: item.typeLabel,
+                    count: 0,
+                    items: [],
+                    indices: [],
+                };
+            }
+            typeGroups[item.type].count++;
+            typeGroups[item.type].items.push(item);
+            typeGroups[item.type].indices.push(index);
+        });
+
+        // 类别显示顺序（按敏感程度排序）
+        const typeOrder = ["id_card", "name", "birth_date", "gender", "ethnic", "address", "phone"];
+        const sortedTypes = Object.keys(typeGroups).sort((a, b) => {
+            const ia = typeOrder.indexOf(a);
+            const ib = typeOrder.indexOf(b);
+            if (ia === -1 && ib === -1) return 0;
+            if (ia === -1) return 1;
+            if (ib === -1) return -1;
+            return ia - ib;
+        });
+
+        // 类别选择列表
+        const typeList = Utils.createEl("div", {
+            class: "pii-type-list",
+            id: "pii-type-list",
+            style: `
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-bottom: 12px;
+            `,
+        });
+
+        sortedTypes.forEach(type => {
+            const group = typeGroups[type];
+            const typeEl = Utils.createEl("label", {
+                class: "pii-type-item",
+                style: `
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    padding: 10px 12px;
+                    background: #fff;
+                    border: 1px solid #e8e8e8;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                `,
+            });
+
+            // 类别复选框
+            const typeCheckbox = Utils.createEl("input", {
+                type: "checkbox",
+                class: "pii-type-checkbox",
+                "data-pii-type": type,
+                checked: true,  // 默认全选
+            });
+            typeEl.appendChild(typeCheckbox);
+
+            // 类型标签 + 数量
+            const typeBadge = Utils.createEl("span", {
+                class: `pii-type-badge pii-type-${type}`,
+                style: "min-width: 70px; text-align: center;",
+            }, group.typeLabel);
+            typeEl.appendChild(typeBadge);
+
+            // 数量标记
+            const countBadge = Utils.createEl("span", {
+                style: `
+                    font-size: 12px;
+                    color: #999;
+                    background: #f5f5f5;
+                    padding: 2px 8px;
+                    border-radius: 10px;
+                `,
+            }, `${group.count} 处`);
+            typeEl.appendChild(countBadge);
+
+            // 示例值（第一个）
+            const sampleValue = Utils.createEl("span", {
+                style: `
+                    font-size: 13px;
+                    color: #555;
+                    margin-left: auto;
+                    max-width: 180px;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                `,
+                title: group.items[0].rawValue,
+            }, `如：${Utils.escapeHtml(group.items[0].value)}`);
+            typeEl.appendChild(sampleValue);
+
+            // 悬停效果
+            typeEl.addEventListener("mouseenter", () => {
+                typeEl.style.borderColor = "#1890ff";
+                typeEl.style.background = "#f0f7ff";
+            });
+            typeEl.addEventListener("mouseleave", () => {
+                if (!typeCheckbox.checked) {
+                    typeEl.style.borderColor = "#e8e8e8";
+                    typeEl.style.background = "#fff";
+                } else {
+                    typeEl.style.borderColor = "#e8e8e8";
+                    typeEl.style.background = "#fff";
+                }
+            });
+
+            typeList.appendChild(typeEl);
+        });
+        piiBox.appendChild(typeList);
+
+        // 全选/取消全选按钮
+        const selectAllRow = Utils.createEl("div", {
+            style: "display: flex; justify-content: space-between; align-items: center;",
+        });
+        const selectAllBtn = Utils.createEl("button", {
+            class: "btn btn-ghost pii-select-all-btn",
+            id: "pii-select-all-btn",
+            style: "padding: 4px 10px; font-size: 12px;",
+        }, "取消全选");
+        selectAllBtn.addEventListener("click", (e) => {
+            e.preventDefault();
+            const checkboxes = document.querySelectorAll(".pii-type-checkbox");
+            const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+            checkboxes.forEach(cb => { cb.checked = !allChecked; });
+            selectAllBtn.textContent = allChecked ? "全选" : "取消全选";
+        });
+        selectAllRow.appendChild(selectAllBtn);
+
+        // 提示文字
+        const hintText = Utils.createEl("span", {
+            style: "font-size: 12px; color: #999;",
+        }, "勾选的类别将在清洗时被黑色打码覆盖");
+        selectAllRow.appendChild(hintText);
+
+        piiBox.appendChild(selectAllRow);
+
+        piiSection.appendChild(piiBox);
+    }
+    card.appendChild(piiSection);
 
     return card;
 }
@@ -636,7 +815,15 @@ function setupCleanButton() {
         btn.textContent = "清洗中...";
 
         try {
-            const result = await sanitizeFile(currentFile, currentResult);
+            // 获取用户勾选的 PII 项（仅图片类型有效）
+            const selectedPiiItems = getSelectedPiiItems();
+
+            const sanitizeOptions = {};
+            if (selectedPiiItems && selectedPiiItems.length > 0) {
+                sanitizeOptions.piiItems = selectedPiiItems;
+            }
+
+            const result = await sanitizeFile(currentFile, currentResult, sanitizeOptions);
             if (result.cleaned) {
                 // 下载清洗后的文件
                 downloadBlob(result.blob, result.filename);
@@ -656,6 +843,34 @@ function setupCleanButton() {
             btn.disabled = false;
         }
     });
+}
+
+/**
+ * 获取用户勾选的 PII 项（按类别读取，返回该类别下的所有 PII 项）
+ * @returns {Array<Object>|null} 选中的 PII 项数组
+ */
+function getSelectedPiiItems() {
+    if (!currentResult || !currentResult.image || !currentResult.image.pii) {
+        return null;
+    }
+    const pii = currentResult.image.pii;
+    if (!pii.hasPii || !pii.items || pii.items.length === 0) {
+        return null;
+    }
+
+    // 读取类别复选框
+    const checkboxes = document.querySelectorAll(".pii-type-checkbox:checked");
+    const selectedTypes = new Set();
+    checkboxes.forEach(cb => {
+        const type = cb.getAttribute("data-pii-type");
+        if (type) selectedTypes.add(type);
+    });
+
+    if (selectedTypes.size === 0) return null;
+
+    // 返回所有选中类别下的 PII 项
+    const selected = pii.items.filter(item => selectedTypes.has(item.type));
+    return selected.length > 0 ? selected : null;
 }
 
 /**
@@ -803,6 +1018,51 @@ function updateFileCardUI(fileData) {
         ? risk.reasons.map(reason => `<li>⚠️ ${Utils.escapeHtml(reason)}</li>`).join("")
         : '<li class="safe-text">✅ 未发现隐蔽风险项</li>';
 
+    // ====== 图片 PII 类别选择区域 ======
+    let piiTypeHtml = "";
+    const imgPii = fileData.result && fileData.result.image && fileData.result.image.pii;
+    if (imgPii && imgPii.hasPii && imgPii.items && imgPii.items.length > 0) {
+        // 按类别分组
+        const typeGroups = {};
+        imgPii.items.forEach((item, idx) => {
+            if (!typeGroups[item.type]) {
+                typeGroups[item.type] = { type: item.type, label: item.typeLabel, count: 0 };
+            }
+            typeGroups[item.type].count++;
+        });
+
+        // 按敏感程度排序
+        const typeOrder = ["id_card", "name", "birth_date", "gender", "ethnic", "address", "phone"];
+        const sortedTypes = Object.keys(typeGroups).sort((a, b) => {
+            const ia = typeOrder.indexOf(a);
+            const ib = typeOrder.indexOf(b);
+            if (ia === -1 && ib === -1) return 0;
+            if (ia === -1) return 1;
+            if (ib === -1) return -1;
+            return ia - ib;
+        });
+
+        const typeItemsHtml = sortedTypes.map(type => {
+            const g = typeGroups[type];
+            return `
+                <label class="pii-type-item-inline" style="display:inline-flex;align-items:center;gap:4px;margin-right:10px;margin-bottom:4px;cursor:pointer;font-size:13px;">
+                    <input type="checkbox" class="pii-type-checkbox" data-pii-type="${type}" checked style="vertical-align:middle;">
+                    <span class="pii-type-badge pii-type-${type}" style="font-size:11px;padding:1px 6px;border-radius:4px;">${g.label}</span>
+                    <span style="color:#999;font-size:11px;">(${g.count}处)</span>
+                </label>
+            `;
+        }).join("");
+
+        piiTypeHtml = `
+            <div class="pii-type-select-area" style="margin-top:10px;padding-top:10px;border-top:1px dashed #ddd;">
+                <div style="font-size:12px;color:#666;margin-bottom:6px;">
+                    📌 选择要清洗的信息类别（默认全选）：
+                </div>
+                <div>${typeItemsHtml}</div>
+            </div>
+        `;
+    }
+
     card.innerHTML = `
         <div class="file-card-header">
             <span class="file-name">${Utils.escapeHtml(fileData.file.name)}</span>
@@ -810,6 +1070,7 @@ function updateFileCardUI(fileData) {
         </div>
         <div class="file-card-body">
             <ul class="risk-hits-list">${hitsListHtml}</ul>
+            ${piiTypeHtml}
         </div>
         <div class="file-card-actions">
             <button class="btn btn-sm btn-primary" onclick="cleanSingleFile('${fileData.id}')">单独清洗</button>
@@ -835,8 +1096,9 @@ function updateCardError(cardId, fileName, errorMsg) {
 /**
  * 单独清洗单个文件
  * @param {string} cardId
+ * @param {Array<Object>} [customPiiItems] - 自定义要打码的 PII 项（不传则读取勾选框）
  */
-async function cleanSingleFile(cardId) {
+async function cleanSingleFile(cardId, customPiiItems) {
     const item = currentBatchData.find(d => d.id === cardId);
     if (!item) return;
 
@@ -848,7 +1110,19 @@ async function cleanSingleFile(cardId) {
     }
 
     try {
-        const result = await sanitizeFile(item.file, item.result);
+        // 获取要打码的 PII 项
+        let piiItems = customPiiItems || null;
+        if (!piiItems) {
+            // 从当前卡片的复选框读取用户勾选的项
+            piiItems = getSelectedPiiItemsFromCard(cardId);
+        }
+
+        const sanitizeOptions = {};
+        if (piiItems && piiItems.length > 0) {
+            sanitizeOptions.piiItems = piiItems;
+        }
+
+        const result = await sanitizeFile(item.file, item.result, sanitizeOptions);
         if (result.cleaned) {
             // 更新卡片 UI 显示已清洗，并提供下载链接
             const actionArea = card.querySelector(".file-card-actions");
@@ -873,6 +1147,47 @@ async function cleanSingleFile(cardId) {
             actionBtn.disabled = false;
         }
     }
+}
+
+/**
+ * 从指定卡片中获取用户勾选的 PII 项（按类别）
+ * 如果卡片中没有类别勾选框（如批量模式），则返回所有 PII 项（默认全清洗）
+ * @param {string} cardId
+ * @returns {Array<Object>|null}
+ */
+function getSelectedPiiItemsFromCard(cardId) {
+    const item = currentBatchData.find(d => d.id === cardId);
+    if (!item || !item.result || !item.result.image || !item.result.image.pii) {
+        return null;
+    }
+    const pii = item.result.image.pii;
+    if (!pii.hasPii || !pii.items || pii.items.length === 0) {
+        return null;
+    }
+
+    const card = Utils.$(`#${cardId}`);
+    if (!card) return pii.items; // 找不到卡片也默认全清洗
+
+    const typeCheckboxes = card.querySelectorAll(".pii-type-checkbox");
+    // 如果卡片中没有类别勾选框（批量模式），默认清洗所有 PII
+    if (typeCheckboxes.length === 0) {
+        return pii.items;
+    }
+
+    // 有类别勾选框，读取勾选的类别
+    const selectedTypes = new Set();
+    typeCheckboxes.forEach(cb => {
+        if (cb.checked) {
+            const type = cb.getAttribute("data-pii-type");
+            if (type) selectedTypes.add(type);
+        }
+    });
+
+    if (selectedTypes.size === 0) return null;
+
+    // 返回所有选中类别下的 PII 项
+    const selected = pii.items.filter(item => selectedTypes.has(item.type));
+    return selected.length > 0 ? selected : null;
 }
 
 /**
@@ -918,7 +1233,14 @@ async function handleBatchClean() {
             }
 
             try {
-                const r = await sanitizeFile(item.file, item.result);
+                // 图片文件：传入检测到的 PII 项进行打码（批量模式默认全清洗）
+                const sanitizeOptions = {};
+                if (item.result && item.result.image && item.result.image.pii
+                    && item.result.image.pii.hasPii && item.result.image.pii.items) {
+                    sanitizeOptions.piiItems = item.result.image.pii.items;
+                }
+
+                const r = await sanitizeFile(item.file, item.result, sanitizeOptions);
                 if (r.cleaned && r.blob) {
                     item.cleaned = true;
                     const name = uniqueName(r.filename || item.file.name);

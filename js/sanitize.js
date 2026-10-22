@@ -16,6 +16,8 @@
  * 清洗文件的入口函数，根据文件类型自动调用对应的清洗方法
  * @param {File} file - 原始文件
  * @param {Object} [analysisResult] - 已有的分析结果（用于判断 PDF 是否需要深度清洗）
+ * @param {Object} [options] - 清洗选项（如图片的 PII 选择性打码）
+ * @param {Array} [options.piiItems] - 需要打码的个人信息项（仅图片有效）
  * @returns {Promise<{ blob: Blob, filename: string, cleaned: boolean, error: string|null }>}
  *
  * 使用方式：
@@ -24,7 +26,7 @@
  *     downloadBlob(result.blob, result.filename);
  *   }
  */
-async function sanitizeFile(file, analysisResult) {
+async function sanitizeFile(file, analysisResult, options) {
     const result = {
         blob: null,        // 清洗后的文件 blob
         filename: "",      // 清洗后的文件名
@@ -44,8 +46,9 @@ async function sanitizeFile(file, analysisResult) {
             result.cleaned = true;
         }
         else if (fileType === "image") {
-            // 图片清洗
-            const cleanedBlob = await sanitizeImage(file);
+            // 图片清洗（支持选择性 PII 打码）
+            const piiItems = options && options.piiItems ? options.piiItems : null;
+            const cleanedBlob = await sanitizeImage(file, piiItems);
             result.blob = cleanedBlob;
             result.filename = makeCleanedFilename(file.name);
             result.cleaned = true;
@@ -353,14 +356,43 @@ function colorDistanceHex(hex1, hex2) {
 
 /**
  * 清洗图片：通过 Canvas 重绘导出，自动去除 EXIF 等元数据
+ * 支持选择性 PII 打码：如果提供 piiItems，则在对应位置画黑框覆盖
  * @param {File} file - 图片文件
+ * @param {Array<Object>} [piiItems] - 需要打码的个人信息项（含 bbox 坐标）
  * @returns {Promise<Blob>} - 清洗后的图片 Blob
  *
  * 原理：
  *   把图片画到 Canvas 上，再从 Canvas 导出成新的图片。
  *   Canvas 导出的图片只包含像素数据，不包含任何 EXIF 元数据。
+ *   如果提供了 piiItems，则在对应位置用黑色矩形覆盖（打码）。
  */
-async function sanitizeImage(file) {
+async function sanitizeImage(file, piiItems) {
+    // 马赛克打码：把 (x,y,w,h) 区域按 blockSize 逐块取平均色填充，像素化后破坏原始信息，
+    // 比纯黑块更美观、更自然，且被覆盖内容无法还原（防反推）。
+    function mosaicCover(ctx, x, y, w, h, blockSize) {
+        const right = x + w;
+        const bottom = y + h;
+        for (let by = y; by < bottom; by += blockSize) {
+            for (let bx = x; bx < right; bx += blockSize) {
+                const bw = Math.min(blockSize, right - bx);
+                const bh = Math.min(blockSize, bottom - by);
+                let imgData;
+                try { imgData = ctx.getImageData(bx, by, bw, bh); } catch (e) { continue; }
+                let r = 0, g = 0, b = 0, a = 0, n = 0;
+                for (let i = 0; i < imgData.data.length; i += 4) {
+                    r += imgData.data[i];
+                    g += imgData.data[i + 1];
+                    b += imgData.data[i + 2];
+                    a += imgData.data[i + 3];
+                    n++;
+                }
+                n = n || 1;
+                ctx.fillStyle = `rgba(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)},${Math.round(a / n)})`;
+                ctx.fillRect(bx, by, bw, bh);
+            }
+        }
+    }
+
     // 把文件转成 DataURL 来加载
     const dataUrl = await new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -385,6 +417,32 @@ async function sanitizeImage(file) {
 
     // 把图画到 Canvas 上
     ctx.drawImage(img, 0, 0);
+
+    // 如果有需要打码的 PII 项，用马赛克覆盖（美观、破坏原始像素、不可还原）
+    if (piiItems && piiItems.length > 0) {
+        // 马赛克块大小：随图片尺寸自适应，保证既美观又能彻底破坏文字
+        const blockSize = Math.max(10, Math.round(Math.min(canvas.width, canvas.height) / 70));
+        // 覆盖边距：加大到 8px，确保 OCR 框略偏时不露字
+        const padding = 8;
+
+        for (const item of piiItems) {
+            // 优先用"整行 bbox"覆盖，保证字段（姓名/性别民族/出生/住址/身份证号）整行遮住，不遗漏
+            const box = item.rowBbox || item.bbox;
+            if (!box) continue;
+            const x0 = Number(box.x0) || 0;
+            const y0 = Number(box.y0) || 0;
+            const x1 = Number(box.x1) || x0;
+            const y1 = Number(box.y1) || y0;
+            const rx = Math.max(0, x0 - padding);
+            const ry = Math.max(0, y0 - padding);
+            const rw = Math.min(canvas.width - rx, x1 - x0 + padding * 2);
+            const rh = Math.min(canvas.height - ry, y1 - y0 + padding * 2);
+            if (rw > 0 && rh > 0) {
+                mosaicCover(ctx, rx, ry, rw, rh, blockSize);
+            }
+        }
+        console.log(`[图片清洗] 已用马赛克对 ${piiItems.length} 处个人信息打码`);
+    }
 
     // 导出为 JPEG（质量 0.92），JPEG 导出天然不带 EXIF
     // 如果原图是 PNG 就导出 PNG（保持透明背景）

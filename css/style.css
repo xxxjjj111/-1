@@ -697,6 +697,75 @@ ul {
     font-style: italic;
 }
 
+/* PII 个人信息勾选列表 */
+.pii-checklist {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.pii-check-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: rgba(255, 255, 255, 0.6);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s;
+}
+
+.pii-check-item:hover {
+    background: rgba(255, 255, 255, 0.9);
+}
+
+.pii-checkbox {
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    accent-color: var(--accent-red);
+}
+
+.pii-type-badge {
+    flex-shrink: 0;
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #fff;
+}
+
+.pii-type-id_card {
+    background: #dc2626;
+}
+
+.pii-type-phone {
+    background: #ea580c;
+}
+
+.pii-type-name {
+    background: #7c3aed;
+}
+
+.pii-type-address {
+    background: #0891b2;
+}
+
+.pii-value {
+    flex: 1;
+    color: var(--text-primary);
+    word-break: break-all;
+    font-family: monospace;
+}
+
+.pii-select-all-btn {
+    display: inline-block;
+}
+
 /* 警告框 */
 .warning-box {
     background: rgba(245, 158, 11, 0.1);

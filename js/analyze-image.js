@@ -4,14 +4,16 @@
  * 主要检测项：
  *   1. EXIF 元数据泄露（相机型号、拍摄时间、GPS 位置等）
  *   2. 缩略图与主图不一致（打码后的照片，缩略图可能还是原图）
+ *   3. 图片内容中的个人信息（PII）识别（身份证号、手机号、姓名、地址等）
  *
- * 依赖：exifr（通过 CDN 或本地引入，全局变量为 exifr）
+ * 依赖：exifr（全局变量 exifr）、Tesseract.js（全局变量 Tesseract，用于 OCR）
  *
  * 返回格式：
  * {
  *   exif: { ... },                // EXIF 信息
  *   gps: { lat, lng, hasGps },    // GPS 信息
  *   thumbnail: { ... },           // 缩略图检测结果
+ *   pii: { ... },                 // 图片内容中的个人信息检测结果
  *   error: null 或 错误信息
  * }
  */
@@ -32,6 +34,7 @@ async function analyzeImage(fileInput) {
         exif: null,       // EXIF 元数据
         gps: null,        // GPS 位置信息
         thumbnail: null,  // 缩略图不一致检测结果
+        pii: null,        // 图片内容中的个人信息（PII）
         error: null,      // 错误信息
     };
 
@@ -78,6 +81,10 @@ async function analyzeImage(fileInput) {
         // 检测缩略图与主图是否不一致
         // 需要同时拿到主图和缩略图来比对
         result.thumbnail = await checkThumbnailMismatch(fileInput, buffer, exifData, MAX_IMAGE_DIMENSION);
+
+        // 检测图片内容中的个人信息（PII）
+        // 使用 Tesseract.js OCR 识别文字，然后用正则匹配身份证号、手机号等
+        result.pii = await detectImagePii(fileInput);
 
     } catch (err) {
         result.error = err.message || "图片解析失败";
@@ -375,6 +382,991 @@ function drawCover(ctx, img, w, h) {
 
     // 画到 Canvas 上
     ctx.drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
+}
+
+// ============================================================
+// 4. 图片内容个人信息（PII）检测
+// ============================================================
+
+/**
+ * 获取 OCR 配置（使用绝对路径，因为 Worker 内部的 importScripts 不支持相对路径）
+ * @returns {Object} OCR 配置对象
+ */
+function getOcrConfig() {
+    const isFileProtocol = window.location.protocol === "file:";
+    let baseUrl;
+
+    if (isFileProtocol) {
+        // file:// 协议下，尝试从当前页面路径推导
+        const path = window.location.pathname;
+        const lastSlash = path.lastIndexOf('/');
+        baseUrl = "file://" + path.substring(0, lastSlash + 1);
+    } else {
+        baseUrl = window.location.origin + window.location.pathname.substring(0, window.location.pathname.lastIndexOf('/') + 1);
+    }
+
+    return {
+        workerPath: baseUrl + "lib/tesseract/worker.min.js",
+        corePath: baseUrl + "lib/tesseract/tesseract-core.wasm.js",
+        langPath: baseUrl + "lib/tesseract/",
+        isFileProtocol: isFileProtocol,
+    };
+}
+
+/**
+ * 检查 OCR 是否可用（file:// 协议下 Web Worker 可能被禁止）
+ * @returns {Object} { available: boolean, reason: string }
+ */
+function checkOcrAvailability() {
+    if (typeof Tesseract === "undefined") {
+        return { available: false, reason: "Tesseract.js 库未加载" };
+    }
+
+    const config = getOcrConfig();
+
+    // file:// 协议下，Chrome 等浏览器禁止 Web Worker 加载本地文件
+    if (config.isFileProtocol) {
+        return {
+            available: false,
+            reason: "当前为本地文件模式（file:// 协议），浏览器安全策略禁止文字识别功能。请使用本地服务器打开本工具（如 Python 的 python -m http.server）。"
+        };
+    }
+
+    return { available: true, reason: null };
+}
+
+/**
+ * 对图片进行 OCR 文字识别
+ * @param {string|File|HTMLImageElement|HTMLCanvasElement} imageSource - 图片源
+ * @param {string} langs - 识别语言，如 'chi_sim+eng'
+ * @returns {Promise<Array>} 识别出的文字块数组 [{ text, bbox: {x0, y0, x1, y1}, confidence }]
+ */
+async function runOCR(imageSource, langs = "chi_sim+eng") {
+    const availability = checkOcrAvailability();
+    if (!availability.available) {
+        console.warn("[OCR] 不可用:", availability.reason);
+        throw new Error(availability.reason);
+    }
+
+    const config = getOcrConfig();
+    let worker = null;
+
+    try {
+        // Tesseract.js v4 API 正确调用序列：
+        // 1. createWorker(options) — 创建 Worker
+        // 2. loadLanguage(langs)   — 加载语言包
+        // 3. initialize(langs, oem) — 初始化引擎（OEM=1 表示 LSTM 引擎）
+        // 4. recognize(imageSource) — 识别图片
+        // workerBlobURL: false — 禁用 Blob 包装，直接 new Worker(workerPath)，
+        // 避免 importScripts 的路径问题
+        console.log("[OCR] 正在创建 Worker...");
+        worker = await Tesseract.createWorker({
+            workerPath: config.workerPath,
+            corePath: config.corePath,
+            langPath: config.langPath,
+            workerBlobURL: false,
+            logger: m => {
+                if (m.status) {
+                    console.log(`[OCR] ${m.status}${m.progress ? ' (' + Math.round(m.progress * 100) + '%)' : ''}`);
+                }
+            },
+        });
+        console.log("[OCR] Worker 创建成功，正在加载语言包...");
+        await worker.loadLanguage(langs);
+        console.log("[OCR] 语言包加载完成，正在初始化引擎...");
+        await worker.initialize(langs, 1); // OEM 1 = Tesseract 引擎（LSTM）
+        console.log("[OCR] 引擎初始化完成，开始识别...");
+
+        const { data } = await worker.recognize(imageSource);
+
+        // 同时收集 words 和 lines
+        // words 用于英文/数字等细粒度匹配
+        // lines 用于中文标签匹配（中文 OCR 常把每个汉字拆成一个 word）
+        const words = [];
+        if (data.words && data.words.length > 0) {
+            for (const w of data.words) {
+                if (w.text && w.text.trim()) {
+                    words.push({
+                        text: w.text.trim(),
+                        bbox: {
+                            x0: w.bbox.x0,
+                            y0: w.bbox.y0,
+                            x1: w.bbox.x1,
+                            y1: w.bbox.y1,
+                        },
+                        confidence: w.confidence || 0,
+                    });
+                }
+            }
+        }
+
+        const lines = [];
+        if (data.lines && data.lines.length > 0) {
+            for (const line of data.lines) {
+                if (line.text && line.text.trim()) {
+                    lines.push({
+                        text: line.text.trim(),
+                        // 去掉中文之间的空格，便于标签匹配
+                        cleanText: line.text.replace(/\s+/g, ""),
+                        bbox: {
+                            x0: line.bbox.x0,
+                            y0: line.bbox.y0,
+                            x1: line.bbox.x1,
+                            y1: line.bbox.y1,
+                        },
+                        confidence: line.confidence || 0,
+                        words: line.words ? line.words.map(w => ({
+                            text: w.text.trim(),
+                            bbox: { x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 },
+                            confidence: w.confidence || 0,
+                        })).filter(w => w.text) : [],
+                    });
+                }
+            }
+        }
+
+        return { words, lines };
+    } catch (err) {
+        console.warn("[OCR] 识别失败:", err.message);
+        throw err;
+    } finally {
+        if (worker) {
+            try {
+                await worker.terminate();
+            } catch (e) {
+                // 忽略终止时的错误
+            }
+        }
+    }
+}
+
+/**
+ * 检测图片中的个人信息（PII）
+ * @param {File|string} fileInput - 图片文件
+ * @returns {Promise<Object>} PII 检测结果
+ *   {
+ *     hasPii: boolean,           // 是否检测到个人信息
+ *     items: Array<Object>,      // 检测到的个人信息列表
+ *     ocrAvailable: boolean,     // OCR 是否可用
+ *     error: string|null         // 错误信息
+ *   }
+ *
+ * 每个 item 的格式：
+ *   {
+ *     type: "id_card" | "phone" | "name" | "address",  // 信息类型
+ *     typeLabel: string,       // 类型中文名
+ *     value: string,           // 识别到的内容
+ *     bbox: {x0, y0, x1, y1},  // 在图片中的位置（像素坐标）
+ *     confidence: number,      // 置信度 0-100
+ *   }
+ */
+async function detectImagePii(fileInput) {
+    const result = {
+        hasPii: false,
+        items: [],
+        ocrAvailable: false,
+        error: null,
+    };
+
+    // 如果 Tesseract 未加载，直接返回（不影响其他检测）
+    if (typeof Tesseract === "undefined") {
+        result.error = "OCR 引擎未加载，跳过图片内容识别";
+        return result;
+    }
+
+    try {
+        // 获取图片的 dataURL 或 File 对象
+        let imageSource;
+        if (fileInput instanceof File) {
+            imageSource = await blobToDataURL(fileInput);
+        } else if (typeof fileInput === "string") {
+            imageSource = fileInput;
+        } else {
+            imageSource = fileInput;
+        }
+
+        // 运行 OCR 识别（带超时保护，避免卡住太久）
+        const ocrPromise = runOCR(imageSource);
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error("OCR 识别超时（30秒）")), 30000);
+        });
+
+        let ocrResult;
+        try {
+            ocrResult = await Promise.race([ocrPromise, timeoutPromise]);
+        } catch (ocrErr) {
+            // 兼容各种错误格式（Error 对象、字符串、Event 对象等）
+            let errMsg = "未知错误";
+            if (ocrErr && typeof ocrErr === "string") {
+                errMsg = ocrErr;
+            } else if (ocrErr && ocrErr.message) {
+                errMsg = ocrErr.message;
+            } else if (ocrErr && ocrErr.error) {
+                errMsg = typeof ocrErr.error === "string" ? ocrErr.error : JSON.stringify(ocrErr.error);
+            } else if (ocrErr && typeof ocrErr === "object") {
+                try {
+                    errMsg = JSON.stringify(ocrErr).substring(0, 200);
+                } catch (e) {
+                    errMsg = String(ocrErr);
+                }
+            }
+            console.warn("[PII检测] OCR 失败:", errMsg);
+            result.error = "文字识别失败：" + errMsg;
+            return result;
+        }
+
+        const { words, lines } = ocrResult;
+        result.ocrAvailable = lines.length > 0 || words.length > 0;
+
+        if (lines.length === 0 && words.length === 0) {
+            return result;
+        }
+
+        // 从 OCR 结果中提取个人信息（主要基于行数据，中文 OCR 更准）
+        const piiItems = extractPiiFromOcr(lines, words);
+        result.items = piiItems;
+        result.hasPii = piiItems.length > 0;
+
+    } catch (err) {
+        result.error = err.message || "PII 检测失败";
+        console.warn("[PII检测] 失败:", err.message);
+    }
+
+    return result;
+}
+
+/**
+ * 从 OCR 识别结果中提取个人信息（基于行数据，中文 OCR 更准）
+ * @param {Array} lines - OCR 行数据 [{ text, cleanText, bbox, words, confidence }]
+ * @param {Array} words - OCR 词数据（用于英文/数字细粒度匹配）
+ * @returns {Array} PII 项数组
+ */
+function extractPiiFromOcr(lines, words) {
+    const items = [];
+    const foundIds = new Set(); // 去重
+
+    // 地址关键词
+    const addressKeywords = ["省", "市", "区", "县", "镇", "乡", "村", "街", "路", "巷", "号", "楼", "室", "小区", "大厦", "公寓"];
+
+    // 先检查每一行（中文标签匹配）
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const text = line.cleanText; // 已去掉空格的文本
+        const fullText = line.text;  // 原始文本（带空格）
+
+        // =====================================================
+        // 1. 身份证号（18位，最后一位可能是 X）
+        // =====================================================
+        const idCardRegex = /[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]/g;
+        let idMatch;
+        idCardRegex.lastIndex = 0;
+        while ((idMatch = idCardRegex.exec(text)) !== null) {
+            const idNum = idMatch[0].toUpperCase();
+            const key = "id_" + idNum;
+            if (!foundIds.has(key)) {
+                foundIds.add(key);
+                // 身份证号通常是数字，直接用整行 bbox，或者找到对应的 word
+                const idWord = findWordForSubstring(line, idMatch.index, idMatch[0].length);
+                items.push({
+                    type: "id_card",
+                    typeLabel: "身份证号",
+                    value: maskIdCard(idNum),
+                    rawValue: idNum,
+                    bbox: idWord || { ...line.bbox },
+                        rowBbox: { ...line.bbox },
+                    confidence: line.confidence,
+                });
+            }
+        }
+
+        // =====================================================
+        // 2. 手机号（11位，1开头）
+        // =====================================================
+        const phoneRegex = /(?<!\d)1[3-9]\d{9}(?!\d)/g;
+        let phoneMatch;
+        phoneRegex.lastIndex = 0;
+        while ((phoneMatch = phoneRegex.exec(text)) !== null) {
+            const phoneNum = phoneMatch[0];
+            const key = "phone_" + phoneNum;
+            if (!foundIds.has(key)) {
+                foundIds.add(key);
+                const phoneWord = findWordForSubstring(line, phoneMatch.index, phoneMatch[0].length);
+                items.push({
+                    type: "phone",
+                    typeLabel: "手机号",
+                    value: maskPhone(phoneNum),
+                    rawValue: phoneNum,
+                    bbox: phoneWord || { ...line.bbox },
+                        rowBbox: { ...line.bbox },
+                    confidence: line.confidence,
+                });
+            }
+        }
+
+        // =====================================================
+        // 3. 姓名检测（"姓名xxx" 格式）
+        // =====================================================
+        const nameMatch = text.match(/姓名([\u4e00-\u9fa5]{2,4})/);
+        if (nameMatch) {
+            const name = nameMatch[1];
+            const key = "name_" + name;
+            if (!foundIds.has(key) && isValidChineseName(name)) {
+                foundIds.add(key);
+                const nameBbox = findSubstringBbox(line, nameMatch.index + 2, name.length); // "姓名"占2字
+                items.push({
+                    type: "name",
+                    typeLabel: "姓名",
+                    value: name,
+                    rawValue: name,
+                    bbox: nameBbox || { ...line.bbox },
+                        rowBbox: { ...line.bbox },
+                    confidence: line.confidence,
+                });
+            }
+        }
+
+        // =====================================================
+        // 4. 性别检测（"性别男/女" 格式）
+        // =====================================================
+        const genderMatch = text.match(/性别([男女])/);
+        if (genderMatch) {
+            const gender = genderMatch[1];
+            const key = "gender_" + gender;
+            if (!foundIds.has(key)) {
+                foundIds.add(key);
+                const genderBbox = findSubstringBbox(line, genderMatch.index + 2, 1); // "性别"占2字
+                items.push({
+                    type: "gender",
+                    typeLabel: "性别",
+                    value: gender,
+                    rawValue: gender,
+                    bbox: genderBbox || { ...line.bbox },
+                        rowBbox: { ...line.bbox },
+                    confidence: line.confidence,
+                });
+            }
+        }
+
+        // =====================================================
+        // 5. 出生日期检测
+        // =====================================================
+        const birthMatch = text.match(/出生(?:日期)?(\d{4})年(\d{1,2})月(\d{1,2})日?/);
+        if (birthMatch) {
+            const year = birthMatch[1];
+            const month = birthMatch[2].padStart(2, "0");
+            const day = birthMatch[3].padStart(2, "0");
+            const birthDate = `${year}年${month}月${day}日`;
+            const key = "birth_" + year + month + day;
+
+            if (!foundIds.has(key) && year >= 1900 && year <= 2100
+                && parseInt(month) >= 1 && parseInt(month) <= 12
+                && parseInt(day) >= 1 && parseInt(day) <= 31) {
+                foundIds.add(key);
+                const birthBbox = findSubstringBbox(line, birthMatch.index + 2, birthMatch[0].length - 2);
+                items.push({
+                    type: "birth_date",
+                    typeLabel: "出生日期",
+                    value: `${year}年**月**日`,
+                    rawValue: birthDate,
+                    bbox: birthBbox || { ...line.bbox },
+                        rowBbox: { ...line.bbox },
+                    confidence: line.confidence,
+                });
+            }
+        }
+
+        // =====================================================
+        // 6. 民族检测
+        // =====================================================
+        const ethnicMatch = text.match(/民族([\u4e00-\u9fa5]{1,4})/);
+        if (ethnicMatch) {
+            const ethnicName = ethnicMatch[1];
+            // 验证是否为有效民族名
+            const validEthnics = ["汉", "蒙古", "回", "藏", "维吾尔", "苗", "彝", "壮", "布依", "朝鲜",
+                "满", "侗", "瑶", "白", "土家", "哈尼", "哈萨克", "傣", "黎", "傈僳",
+                "佤", "畲", "高山", "拉祜", "水", "东乡", "纳西", "景颇", "柯尔克孜", "土",
+                "达斡尔", "仫佬", "羌", "布朗", "撒拉", "毛南", "仡佬", "锡伯", "阿昌", "普米"];
+            if (validEthnics.includes(ethnicName)) {
+                const key = "ethnic_" + ethnicName;
+                if (!foundIds.has(key)) {
+                    foundIds.add(key);
+                    const ethnicBbox = findSubstringBbox(line, ethnicMatch.index + 2, ethnicName.length);
+                    items.push({
+                        type: "ethnic",
+                        typeLabel: "民族",
+                        value: ethnicName,
+                        rawValue: ethnicName,
+                        bbox: ethnicBbox || { ...line.bbox },
+                            rowBbox: { ...line.bbox },
+                        confidence: line.confidence,
+                    });
+                }
+            }
+        }
+
+        // =====================================================
+        // 7. 地址检测（"住址xxx" 或 "地址xxx" 格式）
+        // =====================================================
+        const addrMatch = text.match(/(?:住址|地址)(.+)$/);
+        if (addrMatch) {
+            const addr = addrMatch[1];
+            if (addr.length >= 3 && containsAddressKeyword(addr, addressKeywords)) {
+                const key = "addr_line_" + i; // 按行去重
+                if (!foundIds.has(key)) {
+                    foundIds.add(key);
+                    // 地址 bbox 从标签后开始，精确匹配文字范围
+                    const addrStartChar = addrMatch.index + 2; // "住址"/"地址"占2字
+                    const addrBbox = findSubstringBbox(line, addrStartChar, addr.length);
+                    // 如果找不到精确 bbox，就用从标签后到行尾的范围（保守估计）
+                    const finalBbox = addrBbox || {
+                        x0: line.bbox.x0 + Math.round((line.bbox.x1 - line.bbox.x0) * 0.3),
+                        y0: line.bbox.y0,
+                        x1: line.bbox.x1,
+                        y1: line.bbox.y1,
+                    };
+                    // 稍微扩大 bbox，确保完全覆盖（上下左右各加 2px）
+                    finalBbox.x0 = Math.max(0, finalBbox.x0 - 2);
+                    finalBbox.y0 = Math.max(0, finalBbox.y0 - 2);
+                    finalBbox.x1 = finalBbox.x1 + 2;
+                    finalBbox.y1 = finalBbox.y1 + 2;
+
+                    items.push({
+                        type: "address",
+                        typeLabel: "地址",
+                        value: maskAddress(addr),
+                        rawValue: addr,
+                        bbox: finalBbox,
+                            rowBbox: finalBbox,
+                        confidence: line.confidence,
+                        _lineIndex: i, // 记录行号，用于后续跨行合并
+                    });
+                }
+            }
+        }
+    }
+
+    // =====================================================
+    // 额外：地址跨行合并（身份证住址常跨 2-3 行）
+    // 策略：
+    //   1. 优先找有"住址/地址"标签的行，从它开始向下合并
+    //   2. 如果没找到标签行，找连续包含地址关键词的行合并
+    // =====================================================
+    (function mergeAddressLines() {
+        // 先找有没有"住址/地址"标签的行
+        // 支持 OCR 常见误识别：住止、住地、位址、往址、任址、住所、住坊等
+        let startIdx = -1;
+        const addrLabelRegex = /^(?:住址|地址|住止|住地|位址|往址|任址|住所|住坊|住址)/;
+        for (let i = 0; i < lines.length; i++) {
+            if (addrLabelRegex.test(lines[i].cleanText)) {
+                startIdx = i;
+                break;
+            }
+        }
+        // 如果行首没匹配到，试试行内是否包含标签（OCR可能把标签和前面的字连在一起）
+        if (startIdx === -1) {
+            for (let i = 0; i < lines.length; i++) {
+                const t = lines[i].cleanText;
+                if (/住址|地址/.test(t) && containsAddressKeyword(t, addressKeywords)) {
+                    startIdx = i;
+                    break;
+                }
+            }
+        }
+
+        // 收集地址行
+        let addrLineIndices = [];
+
+        if (startIdx !== -1) {
+            // 有标签：从标签行开始，向下收集包含地址关键词的连续行
+            // 遇到"公民身份号码"等明确标签就停止
+            addrLineIndices.push(startIdx);
+            for (let j = startIdx + 1; j < Math.min(lines.length, startIdx + 4); j++) {
+                const nextClean = lines[j].cleanText;
+                // 遇到这些标签行说明地址区域结束了
+                if (/^(?:公民身份号码|公民|身份号码|签发机关|有效期限|签发|有效|期限|编号)/.test(nextClean)) {
+                    break;
+                }
+                // 遇到其他字段标签也停止
+                if (/^(?:姓名|性别|民族|出生)/.test(nextClean)) {
+                    break;
+                }
+                // 必须包含地址关键词才算地址行
+                if (nextClean.length >= 2 && containsAddressKeyword(nextClean, addressKeywords)) {
+                    addrLineIndices.push(j);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // 无标签：先用出生行和身份证号行界定搜索范围，然后在范围内找地址
+            // 身份证布局：姓名 → 性别民族 → 出生 → 住址(2-3行) → 公民身份号码
+            let birthLineIdx = -1;
+            let idNumLineIdx = -1;
+
+            // 找出生行
+            for (let i = 0; i < lines.length; i++) {
+                const t = lines[i].cleanText;
+                if (/出生/.test(t) && /\d{4}.*年.*\d{1,2}.*月/.test(t)) {
+                    birthLineIdx = i;
+                    break;
+                }
+            }
+            if (birthLineIdx === -1) {
+                for (let i = 0; i < lines.length; i++) {
+                    if (/出生/.test(lines[i].cleanText)) {
+                        birthLineIdx = i;
+                        break;
+                    }
+                }
+            }
+
+            // 找身份证号行
+            for (let i = 0; i < lines.length; i++) {
+                const t = lines[i].cleanText;
+                if (/[1-9]\d{5}(?:19|20)\d{2}\d{7}[\dXx]/.test(t)) {
+                    idNumLineIdx = i;
+                    break;
+                }
+                if (/公民身份号码/.test(t)) {
+                    if (/\d{17}[\dXx]/.test(t)) {
+                        idNumLineIdx = i;
+                    } else {
+                        idNumLineIdx = i + 1;
+                    }
+                    break;
+                }
+                if (/^(?:身份号码|公民身份)/.test(t)) {
+                    idNumLineIdx = i + 1;
+                    break;
+                }
+            }
+
+            // 确定搜索范围：出生行下一行 到 身份证号行上一行
+            const searchStart = birthLineIdx !== -1 ? birthLineIdx + 1 : 0;
+            const searchEnd = idNumLineIdx !== -1 ? idNumLineIdx - 1 : lines.length - 1;
+
+            // 在范围内找连续包含地址关键词的行
+            let consecutiveStart = -1;
+            let consecutiveCount = 0;
+            let bestStart = -1;
+            let bestCount = 0;
+
+            for (let i = searchStart; i <= searchEnd && i < lines.length; i++) {
+                const cleanText = lines[i].cleanText;
+                if (cleanText.length < 2) {
+                    if (consecutiveCount > bestCount) {
+                        bestStart = consecutiveStart;
+                        bestCount = consecutiveCount;
+                    }
+                    consecutiveStart = -1;
+                    consecutiveCount = 0;
+                    continue;
+                }
+                const chineseCount = (cleanText.match(/[\u4e00-\u9fa5]/g) || []).length;
+                const digitCount = (cleanText.match(/\d/g) || []).length;
+                if (chineseCount + digitCount < 2) {
+                    if (consecutiveCount > bestCount) {
+                        bestStart = consecutiveStart;
+                        bestCount = consecutiveCount;
+                    }
+                    consecutiveStart = -1;
+                    consecutiveCount = 0;
+                    continue;
+                }
+                // 遇到明确的标签行就停止
+                if (/^(?:姓名|性别|民族|出生|公民|身份|签发|有效|期限|编号)/.test(cleanText)) {
+                    if (consecutiveCount > bestCount) {
+                        bestStart = consecutiveStart;
+                        bestCount = consecutiveCount;
+                    }
+                    consecutiveStart = -1;
+                    consecutiveCount = 0;
+                    continue;
+                }
+                if (containsAddressKeyword(cleanText, addressKeywords)) {
+                    if (consecutiveStart === -1) consecutiveStart = i;
+                    consecutiveCount++;
+                } else {
+                    if (consecutiveCount > bestCount) {
+                        bestStart = consecutiveStart;
+                        bestCount = consecutiveCount;
+                    }
+                    consecutiveStart = -1;
+                    consecutiveCount = 0;
+                }
+            }
+            if (consecutiveCount > bestCount) {
+                bestStart = consecutiveStart;
+                bestCount = consecutiveCount;
+            }
+
+            if (bestCount >= 1 && bestStart !== -1) {
+                for (let k = 0; k < bestCount; k++) {
+                    addrLineIndices.push(bestStart + k);
+                }
+            }
+        }
+
+        if (addrLineIndices.length === 0) return;
+
+        const firstLine = lines[addrLineIndices[0]];
+        const lastLine = lines[addrLineIndices[addrLineIndices.length - 1]];
+
+        // 删除之前所有单独的地址项（用合并后的替换）
+        for (let idx = items.length - 1; idx >= 0; idx--) {
+            if (items[idx].type === "address") {
+                items.splice(idx, 1);
+            }
+        }
+
+        // 计算合并后的 bbox
+        // 核心策略：每行都用 words 精确定位实际文字范围，不取整行
+        // 第一行如果有标签，从标签后面的文字开始
+        let baseX0 = Infinity, baseX1 = 0;  // 地址文字的 x 范围
+        let minY = Infinity, maxY = 0;       // 全部 y 范围
+        let hasFirstLineLabel = false;       // 第一行是否有标签
+
+        for (let i = 0; i < addrLineIndices.length; i++) {
+            const idx = addrLineIndices[i];
+            const l = lines[idx];
+            const isFirstLine = i === 0;
+
+            // 地址区域完整覆盖：直接使用整行 bbox，不做精确裁剪。
+            // 原因：OCR 常漏字（如"北京市"识别成"京市"）或文字超出识别框，
+            // 用 words 精确框会导致地址露边。用户要求"完整、不可还原"优先于"只遮地址"。
+            let lineTextX0 = l.bbox.x0;
+            let lineTextX1 = l.bbox.x1;
+
+            // 若有地址标签，把标签也纳入覆盖范围（标签到内容整段遮住）
+            if (addrLabelRegex.test(l.cleanText)) {
+                hasFirstLineLabel = true;
+            }
+
+            // 更新 y 范围（所有行都参与）
+            minY = Math.min(minY, l.bbox.y0);
+            maxY = Math.max(maxY, l.bbox.y1);
+
+            // 更新 x 范围（所有行都参与，因为每行都是地址的一部分）
+            baseX0 = Math.min(baseX0, lineTextX0);
+            baseX1 = Math.max(baseX1, lineTextX1);
+        }
+
+        // 如果没有找到有效 x 范围，用第一行和最后一行的文字区域兜底
+        if (baseX0 === Infinity) {
+            baseX0 = lines[addrLineIndices[0]].bbox.x0;
+            baseX1 = lines[addrLineIndices[addrLineIndices.length - 1]].bbox.x1;
+        }
+
+        // 用身份证上各字段的值位置作为地址边界参考
+        // 核心原则：地址文字和其他字段值左对齐，且不超过身份证号行的右边界
+        let nameValueX0 = -1;       // 姓名值的左边界（用于左对齐）
+        let idNumValueX1 = -1;      // 身份证号值的右边界（用于右边界上限）
+        let fieldValueX1s = [];     // 收集所有字段值的右边界
+        let birthLineY1 = -1;       // 出生行的下边界（用于限制地址上边界）
+
+        for (let i = 0; i < lines.length; i++) {
+            const t = lines[i].cleanText;
+            const line = lines[i];
+
+            // 姓名行
+            const nameMatch = t.match(/姓名([\u4e00-\u9fa5]{2,4})/);
+            if (nameMatch && isValidChineseName(nameMatch[1])) {
+                const subBbox = findSubstringBbox(line, nameMatch.index + 2, nameMatch[1].length);
+                if (subBbox) {
+                    nameValueX0 = subBbox.x0;
+                    fieldValueX1s.push(subBbox.x1);
+                }
+            }
+
+            // 出生行
+            const birthMatch = t.match(/出生(?:日期)?(\d{4})年(\d{1,2})月(\d{1,2})日?/);
+            if (birthMatch) {
+                const subBbox = findSubstringBbox(line, birthMatch.index + 2, birthMatch[0].length - 2);
+                if (subBbox) {
+                    fieldValueX1s.push(subBbox.x1);
+                }
+                birthLineY1 = line.bbox.y1; // 记录出生行的下边界
+            }
+
+            // 性别民族行
+            const genderEthnicMatch = t.match(/性别[男女].*民族[\u4e00-\u9fa5]{1,4}/);
+            if (genderEthnicMatch) {
+                const subBbox = findSubstringBbox(line, genderEthnicMatch.index, genderEthnicMatch[0].length);
+                if (subBbox) {
+                    fieldValueX1s.push(subBbox.x1);
+                }
+            }
+
+            // 身份证号行（最可靠的右边界参考，因为身份证号最长）
+            const idMatch = t.match(/[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]/);
+            if (idMatch) {
+                const subBbox = findSubstringBbox(line, idMatch.index, idMatch[0].length);
+                if (subBbox) {
+                    idNumValueX1 = subBbox.x1;
+                    fieldValueX1s.push(subBbox.x1);
+                }
+            }
+            // "公民身份号码" + 数字的行
+            if (/公民身份号码.*\d{17}[\dXx]/.test(t)) {
+                const numMatch = t.match(/\d{17}[\dXx]/);
+                if (numMatch) {
+                    const subBbox = findSubstringBbox(line, numMatch.index, numMatch[0].length);
+                    if (subBbox) {
+                        idNumValueX1 = subBbox.x1;
+                        fieldValueX1s.push(subBbox.x1);
+                    }
+                }
+            }
+        }
+
+        // 左边界：放宽，避免把"住址"标签/左端内容截掉
+        if (nameValueX0 > 0 && baseX0 < nameValueX0 - 30) {
+            baseX0 = nameValueX0 - 8;
+        }
+
+        // 右边界：放宽上限，避免地址右端（如"8号院""210室"）被截断导致露字。
+        // 以身份证号行右边界 + 40px 为宽松上限；拿不到则用最宽字段 + 60px。
+        // 身份证号通常是整卡最宽的字段，地址不可能比它更宽，故不会过度遮挡。
+        let maxAddrX1 = -1;
+        if (idNumValueX1 > 0) {
+            maxAddrX1 = idNumValueX1 + 40;
+        } else if (fieldValueX1s.length > 0) {
+            maxAddrX1 = Math.max(...fieldValueX1s) + 60;
+        }
+        if (maxAddrX1 > 0 && baseX1 > maxAddrX1) {
+            baseX1 = maxAddrX1;
+        }
+
+        // 上边界：放宽，出生行本身也是敏感信息，略重叠无妨
+        if (birthLineY1 > 0 && minY < birthLineY1 + 2) {
+            minY = birthLineY1 + 2;
+        }
+
+        // x/y 范围加大余量，确保覆盖完整、不露边（用户要求"完整、不可还原"优先）
+        const finalX0 = Math.max(0, baseX0 - 6);
+        const finalY0 = Math.max(0, minY - 4);
+        const finalX1 = baseX1 + 6;
+        const finalY1 = maxY + 4;
+
+        // 合并地址文本
+        const fullAddr = addrLineIndices.map((idx, k) => {
+            const l = lines[idx];
+            if (k === 0 && /^(?:住址|地址)/.test(l.cleanText)) {
+                return l.cleanText.replace(/^(?:住址|地址)/, "");
+            }
+            return l.cleanText;
+        }).join("");
+
+        const key = "addr_merged_" + addrLineIndices.join("_");
+        if (!foundIds.has(key)) {
+            foundIds.add(key);
+            items.push({
+                type: "address",
+                typeLabel: "地址",
+                value: maskAddress(fullAddr),
+                rawValue: fullAddr,
+                bbox: { x0: Math.round(finalX0), y0: Math.round(finalY0), x1: Math.round(finalX1), y1: Math.round(finalY1) },
+                confidence: Math.min(...addrLineIndices.map(idx => lines[idx].confidence)),
+            });
+        }
+    })();
+
+    // =====================================================
+    // 后处理：统一收紧所有地址条目的 bbox 边界
+    // 避免 OCR 把人像区域的噪点识别成文字导致 bbox 过大
+    // =====================================================
+    (function tightenAddressBboxes() {
+        // 找出生日期的值右边界作为参考（地址和出生的值宽度差不多）
+        let birthValueX1 = -1;
+        // 找姓名值的左边界作为参考（地址和姓名左对齐）
+        let nameValueX0 = -1;
+        // 找出生行的下边界（地址不能盖住出生日期）
+        let birthLineY1 = -1;
+
+        for (let i = 0; i < lines.length; i++) {
+            const t = lines[i].cleanText;
+            const line = lines[i];
+
+            // 姓名行
+            const nameMatch = t.match(/姓名([\u4e00-\u9fa5]{2,4})/);
+            if (nameMatch && isValidChineseName(nameMatch[1])) {
+                const subBbox = findSubstringBbox(line, nameMatch.index + 2, nameMatch[1].length);
+                if (subBbox) nameValueX0 = subBbox.x0;
+            }
+
+            // 出生行
+            const birthMatch = t.match(/出生(?:日期)?(\d{4})年(\d{1,2})月(\d{1,2})日?/);
+            if (birthMatch) {
+                const subBbox = findSubstringBbox(line, birthMatch.index + 2, birthMatch[0].length - 2);
+                if (subBbox) birthValueX1 = subBbox.x1;
+                birthLineY1 = line.bbox.y1;
+                break;
+            }
+        }
+
+        // 对所有地址条目收紧边界
+        for (const item of items) {
+            if (item.type !== "address") continue;
+
+            // 左边界：对齐姓名值
+            if (nameValueX0 > 0 && item.bbox.x0 < nameValueX0 - 5) {
+                item.bbox.x0 = Math.round(nameValueX0 - 2);
+            }
+
+            // 右边界：不超过出生日期值 + 40px（约 2 个字的余量）
+            if (birthValueX1 > 0) {
+                const maxX1 = birthValueX1 + 40;
+                if (item.bbox.x1 > maxX1) {
+                    item.bbox.x1 = Math.round(maxX1);
+                }
+            }
+
+            // 上边界：不能低于出生行下边界
+            if (birthLineY1 > 0 && item.bbox.y0 < birthLineY1) {
+                item.bbox.y0 = Math.round(birthLineY1 + 3);
+            }
+        }
+    })();
+
+    // 清理内部用的 _lineIndex 属性
+    items.forEach(item => delete item._lineIndex);
+
+    return items;
+}
+
+/**
+ * 在一行中找到指定位置子串对应的 bbox
+ * @param {Object} line - 行数据
+ * @param {number} charIndex - 子串在 cleanText 中的起始字符位置
+ * @param {number} charLength - 子串长度（字符数）
+ * @returns {Object|null} bbox 对象 {x0, y0, x1, y1} 或 null
+ */
+function findWordForSubstring(line, charIndex, charLength) {
+    if (!line.words || line.words.length === 0) return null;
+
+    // 计算每个 word 在 cleanText 中的字符偏移
+    // 由于中文每个字可能是一个 word，数字/英文可能合并成一个 word，
+    // 我们需要逐字累加来定位
+    let currentCharIdx = 0;
+    let startWord = null;
+    let endWord = null;
+
+    for (let i = 0; i < line.words.length; i++) {
+        const word = line.words[i];
+        const wordText = word.text.replace(/\s+/g, ""); // 去掉空格
+        if (wordText.length === 0) continue;
+
+        const wordStart = currentCharIdx;
+        const wordEnd = currentCharIdx + wordText.length - 1;
+
+        if (startWord === null && charIndex <= wordEnd) {
+            startWord = word;
+        }
+        if (charIndex + charLength - 1 <= wordEnd) {
+            endWord = word;
+            break;
+        }
+
+        currentCharIdx += wordText.length;
+    }
+
+    // 如果没找到 endWord，用最后一个 word
+    if (!endWord && line.words.length > 0) {
+        endWord = line.words[line.words.length - 1];
+    }
+    if (!startWord && line.words.length > 0) {
+        startWord = line.words[0];
+    }
+
+    if (!startWord || !endWord) return null;
+
+    return {
+        x0: startWord.bbox.x0,
+        y0: startWord.bbox.y0,
+        x1: endWord.bbox.x1,
+        y1: endWord.bbox.y1,
+    };
+}
+
+/**
+ * 计算行内指定字符位置范围的 bbox
+ * @param {Object} line - 行数据
+ * @param {number} startChar - 起始字符位置（cleanText 中）
+ * @param {number} length - 字符长度
+ * @returns {Object|null} bbox
+ */
+function findSubstringBbox(line, startChar, length) {
+    return findWordForSubstring(line, startChar, length);
+}
+
+/**
+ * 判断是否为有效的中文姓名（2-4个中文字符，且不是常见的非姓名字）
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isValidChineseName(name) {
+    // 长度 2-4 个中文字符
+    if (!/^[\u4e00-\u9fa5]{2,4}$/.test(name)) return false;
+
+    // 排除常见的非姓名词汇
+    const excludeWords = ["身份证", "手机号", "电话号", "地址", "姓名", "出生", "性别", "民族", "住址",
+        "公司", "单位", "学校", "备注", "说明", "日期", "编号", "代码", "类型", "状态"];
+    for (const w of excludeWords) {
+        if (name.includes(w)) return false;
+    }
+
+    return true;
+}
+
+/**
+ * 检查文本是否包含地址关键词
+ * @param {string} text
+ * @param {string[]} keywords
+ * @returns {boolean}
+ */
+function containsAddressKeyword(text, keywords) {
+    for (const kw of keywords) {
+        if (text.includes(kw)) return true;
+    }
+    return false;
+}
+
+/**
+ * 脱敏身份证号（保留前6后4，中间用*代替）
+ * @param {string} idNum
+ * @returns {string}
+ */
+function maskIdCard(idNum) {
+    if (idNum.length < 10) return idNum;
+    return idNum.substring(0, 6) + "********" + idNum.substring(idNum.length - 4);
+}
+
+/**
+ * 脱敏手机号（保留前3后4，中间用*代替）
+ * @param {string} phone
+ * @returns {string}
+ */
+function maskPhone(phone) {
+    if (phone.length < 11) return phone;
+    return phone.substring(0, 3) + "****" + phone.substring(phone.length - 4);
+}
+
+/**
+ * 脱敏地址（只保留到区/县一级，后面用*代替）
+ * @param {string} addr
+ * @returns {string}
+ */
+function maskAddress(addr) {
+    // 找到"区"或"县"的位置，保留到那里
+    const match = addr.match(/^(.+?(?:区|县|市))/);
+    if (match) {
+        return match[1] + "****";
+    }
+    // 否则只保留前6个字符
+    if (addr.length > 6) {
+        return addr.substring(0, 6) + "****";
+    }
+    return addr;
 }
 
 // ============================================================
